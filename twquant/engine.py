@@ -41,7 +41,13 @@ class Position:
     entry_date: str
     entry_price: float
     last_close: float
-    prev_close: float
+    entry_fee: float = 0.0
+    # 進場價目前換算到哪個價格基準（分割/減資時會變）。用來判斷要不要再把成本換算一次。
+    basis: float = 1.0
+
+
+def _finite(x: float) -> bool:
+    return x == x and x not in (float("inf"), float("-inf"))
 
 
 @dataclass
@@ -146,6 +152,7 @@ class PortfolioBacktester:
         benchmark: str | None = "0050",
         progress: bool = False,
         adj_returns: dict[str, dict[str, float]] | None = None,
+        benchmark_data: dict[str, list[Bar]] | None = None,
     ) -> BacktestResult:
         dates = self._trading_dates(data, start, end)
         if len(dates) < 40:
@@ -181,14 +188,35 @@ class PortfolioBacktester:
                 pending = []
 
             # 2) 收盤後評價
+            #
+            # 台股用「還原價」當基準：分割/減資當天價格會被重新定價（4:1 就是砍成 1/4），
+            # 持有人的財富不該因此改變。所以在那一天把「進場價換算到的基準」與成本一起
+            # 搬過去，並讓 last_close 直接等於「今天的還原價」。
+            #
+            # 這裡不能用「last_close × (1+r)」連乘：分割日的 r 是 0，那個寫法會讓
+            # last_close 停在舊價位，之後每天都算出同一個 ratio 並重複相乘（會炸到 inf）。
             holdings_val = 0.0
             for p in positions.values():
                 b = today.get(p.ticker)
                 if b:
-                    # 有校正過的日報酬就用報酬推，分割/減資日才不會被當成崩盤
                     r = (adj_returns or {}).get(p.ticker, {}).get(d)
-                    p.prev_close = p.last_close
-                    p.last_close = p.last_close * (1 + r) if r is not None else b.close
+                    if r is None or b.close <= 0 or not _finite(r):
+                        p.last_close = b.close
+                    else:
+                        implied = p.last_close * (1 + r)
+                        raw_now = b.close * p.basis
+                        ratio = 1.0
+                        if _finite(implied) and _finite(raw_now) and raw_now > 0:
+                            ratio = implied / raw_now
+                        # 明顯偏離 1 才當成重新定價；順便擋掉 inf / 0 / NaN 這些病態值
+                        if not _finite(ratio) or ratio <= 0 or abs(ratio - 1.0) <= 1e-9:
+                            ratio = 1.0
+                        if ratio != 1.0:
+                            p.basis *= ratio
+                            p.entry_price /= ratio
+                            p.cost /= ratio
+                            raw_now = b.close * p.basis
+                        p.last_close = raw_now if _finite(raw_now) and raw_now > 0 else b.close
                 holdings_val += p.shares * p.last_close
             equity = cash + holdings_val
             ret = (equity / prev_equity - 1) if prev_equity > 0 else 0.0
@@ -223,7 +251,8 @@ class PortfolioBacktester:
             costs=costs,
         )
         result.metrics = compute_metrics(snaps, trades)
-        self._add_benchmark(result, data, dates, benchmark, adj_returns)
+        # 基準可能不在交易宇宙裡（例如 0050 被刻意排除），所以允許另外給一份資料
+        self._add_benchmark(result, benchmark_data or data, dates, benchmark, adj_returns)
         return result
 
     # --- 訂單規劃 -------------------------------------------------------------
@@ -242,18 +271,33 @@ class PortfolioBacktester:
         day_no: int,
     ) -> list[dict]:
         orders: list[dict] = []
-        sells = {o.ticker for o in resp.orders if o.action == "sell"}
-        reasons = {o.ticker: o.reason for o in resp.orders}
+        intents = {o.ticker: o for o in resp.orders}
+        sells = {t for t, o in intents.items() if o.action == "sell"}
         keep = set(resp.allocation) | sells
 
-        # 清倉：持有但沒被列入 allocation
+        # 清倉：持有但沒被列入 allocation。這輪已經處理過的 ticker 不再進第二次，
+        # 否則「清倉 + 策略明確賣出」會產生兩筆同樣的賣單（實單會變成重複委託）
+        handled: set[str] = set()
         for t, p in positions.items():
             if t not in keep and p.shares > 0:
                 orders.append({"side": "sell", "ticker": t, "shares": p.shares, "reason": "rebalance"})
+                handled.add(t)
         for t in sells:
+            if t in handled:
+                continue
             p = positions.get(t)
-            if p and p.shares > 0:
-                orders.append({"side": "sell", "ticker": t, "shares": p.shares, "reason": reasons.get(t, "signal")})
+            if not p or p.shares <= 0:
+                continue
+            want = intents[t].shares
+            if want is None:
+                want = p.shares
+            # 部分出場要湊整張，湊不出來就清掉，避免留下無法處理的零股
+            shares = min(p.shares, (max(want, 0) // self.cost.lot) * self.cost.lot)
+            if shares < self.cost.lot:
+                shares = p.shares
+            orders.append(
+                {"side": "sell", "ticker": t, "shares": shares, "reason": intents[t].reason or "signal"}
+            )
 
         free = max(self.max_positions - len([t for t in positions if t not in sells]), 0)
         targets = {t: w for t, w in resp.allocation.items() if w > 0}
@@ -271,8 +315,12 @@ class PortfolioBacktester:
                 continue
             held = positions[t].shares if t in positions else 0
             budget = equity * w
+            if budget <= 0:
+                continue
             if held > 0:
                 current = held * prev.close
+                if prev.close <= 0:
+                    continue
                 delta = int((budget - current) / prev.close / self.cost.lot) * self.cost.lot
                 if delta >= self.cost.lot:
                     orders.append({"side": "buy", "ticker": t, "shares": delta, "reason": "add"})
@@ -309,19 +357,26 @@ class PortfolioBacktester:
         for o in execs:
             t, b = o["ticker"], o["bar"]
             if o["side"] == "sell":
-                p = positions.pop(t, None)
-                if p is None:
+                p = positions.get(t)
+                if p is None or p.shares <= 0:
                     continue
+                sold = min(int(o["shares"]), p.shares)
+                if sold <= 0:
+                    continue
+                frac = sold / p.shares
                 px = self._sell_price(b.open)
-                gross = px * p.shares
+                gross = px * sold
                 fee = self._fee(gross)
                 tax = gross * self.cost.tax_sell
                 cash += gross - fee - tax
                 costs.fee += fee
                 costs.tax += tax
-                costs.slippage += (b.open - px) * p.shares
-                pnl = (px - p.entry_price) * p.shares - fee - tax
-                base = p.entry_price * p.shares
+                costs.slippage += (b.open - px) * sold
+                # 損益要含去程成本，否則交易紀錄的總和對不上權益曲線的變化。
+                # 部分出場時費用按比例分攤（以股數為權重）。
+                fee_share = p.entry_fee * frac
+                pnl = (px - p.entry_price) * sold - fee - tax - fee_share
+                base = p.entry_price * sold
                 trades.append(
                     Trade(
                         t,
@@ -329,13 +384,18 @@ class PortfolioBacktester:
                         b.date,
                         round(p.entry_price, 4),
                         round(px, 4),
-                        p.shares,
+                        sold,
                         round(pnl, 2),
                         round(pnl / base, 5) if base else 0.0,
                         self._days_between(p.entry_date, b.date),
                         o.get("reason", ""),
                     )
                 )
+                if sold >= p.shares:
+                    positions.pop(t, None)
+                else:
+                    p.shares -= sold
+                    p.entry_fee -= fee_share
             else:
                 px = self._buy_price(b.open)
                 shares = int(o["shares"])
@@ -348,11 +408,16 @@ class PortfolioBacktester:
                 costs.slippage += (px - b.open) * shares
                 if t in positions:
                     p = positions[t]
-                    total = p.cost * p.shares + gross + fee
-                    p.shares += shares
-                    p.cost = total / p.shares
+                    if p.shares <= 0:
+                        positions.pop(t, None)
+                        positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, fee)
+                    else:
+                        total = p.cost * p.shares + gross + fee
+                        p.shares += shares
+                        p.cost = total / p.shares
+                        p.entry_fee += fee
                 else:
-                    positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, b.close)
+                    positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, fee)
         return cash
 
     def _tradable(self, bar: Bar, prev_close: float, side: str) -> tuple[bool, str]:
@@ -413,8 +478,8 @@ class PortfolioBacktester:
     # --- 基準 -----------------------------------------------------------------
 
     def _add_benchmark(self, result: BacktestResult, data, dates, benchmark, adj_returns=None) -> None:
-        curve = self._bh_curve(data, dates, benchmark, adj_returns)
-        result.benchmark_label = f"buy&hold {benchmark}" if benchmark else "equal-weight B&H"
+        curve, label = self._bh_curve(data, dates, benchmark, adj_returns)
+        result.benchmark_label = label
         if not curve:
             return
         result.benchmark_curve = curve
@@ -428,8 +493,11 @@ class PortfolioBacktester:
             "sharpe": _sharpe(rets),
         }
 
-    def _bh_curve(self, data, dates, benchmark, adj_returns=None) -> list[tuple[str, float]]:
-        """買進持有基準曲線。
+    def _bh_curve(self, data, dates, benchmark, adj_returns=None) -> tuple[list[tuple[str, float]], str]:
+        """買進持有基準曲線。回傳 (曲線, 這個曲線到底是什麼)。
+
+        標籤一定要跟著回傳，不能沿用「使用者要求的 benchmark」——
+        指定標的沒抓到時會降級成等權基準，那時候報表上寫「buy&hold 0050」就是在說謊。
 
         用「日報酬連乘」而不是價格相對第一天的比值。差別在減資/分割：
         價格法會把一次 4:1 分割當成 -75% 的永久虧損，日報酬法只影響那一天。
@@ -437,12 +505,14 @@ class PortfolioBacktester:
         """
         if benchmark and benchmark in data:
             picked = {benchmark: 1.0}
+            label = f"buy&hold {benchmark}"
         else:
             picks = [t for t in data if data[t]]
             if not picks:
-                return []
+                return [], "無基準"
             w = 1.0 / len(picks)
             picked = {t: w for t in picks}
+            label = f"等權買進持有（{len(picks)} 檔）"
 
         maps = {t: {b.date: b for b in data[t]} for t in picked}
         adj = adj_returns or {}
@@ -471,7 +541,7 @@ class PortfolioBacktester:
                 continue
             equity *= 1 + r
             out.append((d, equity))
-        return out
+        return out, label
 
 
 # --- 績效指標 -----------------------------------------------------------------

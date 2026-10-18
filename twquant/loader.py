@@ -39,11 +39,27 @@ class Bar:
     volume: int
 
 
+def bars_from_rows(rows) -> list[Bar]:
+    """把 SQLite 的列轉成 Bar，順手濾掉壞資料。
+
+    FinMind 對部分標的會回傳 open/close 為 0 的 bar（006208 的早期資料有 152 根這種），
+    這種 bar 進了回測會讓「以價格為分母」的計算爆掉或算出無限大的部位，
+    所以一律在載入時就擋掉，而不是等到引擎裡四處散落防禦性檢查。
+    """
+    out: list[Bar] = []
+    for r in rows:
+        try:
+            o, h, lo, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+        except (TypeError, ValueError):
+            continue
+        if o <= 0 or h <= 0 or lo <= 0 or c <= 0:
+            continue
+        out.append(Bar(str(r[0])[:10], o, h, lo, c, int(r[5] or 0)))
+    return out
+
+
 def load_bars(store: Store, ticker: str, start: str, end: str) -> list[Bar]:
-    return [
-        Bar(r[0], r[1], r[2], r[3], r[4], r[5])
-        for r in store.load_bars(ticker, start, end)
-    ]
+    return bars_from_rows(store.load_bars(ticker, start, end))
 
 
 BREAK_TOL = 0.02
@@ -104,11 +120,12 @@ def load_adj_returns(
     for i in range(1, len(rows)):
         d0, c0 = rows[i - 1][0], rows[i - 1][4]
         d1, c1 = rows[i][0], rows[i][4]
+        if c0 is None or c1 is None or c0 <= 0 or c1 <= 0:
+            out[d1] = 0.0
+            continue
         f0, f1 = factors.get(d0, 1.0), factors.get(d1, 1.0)
         if f1 != f0:
             out[d1] = 0.0
-            continue
-        if c0 <= 0:
             continue
         r = c1 / c0 - 1
         out[d1] = 0.0 if abs(r) >= jump else r

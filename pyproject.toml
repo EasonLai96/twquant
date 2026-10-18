@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twquant"
-version = "0.1.0"
+version = "0.1.1"
 description = "台股量化回測工具包 — 零外部依賴、把台股真實摩擦建模進去的 backtester"
 readme = "README.md"
 requires-python = ">=3.11"

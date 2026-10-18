@@ -15,6 +15,11 @@ from .strategies import TrendMA
 # 每個 fold 前方多抓的暖機交易日，確保 OS 第一天指標就已經成熟
 WARMUP = 120
 
+# 可以拿來挑參數的指標；限定白名單是因為未知的 metric 會靜默選出網格第一組
+VALID_METRICS = frozenset(
+    {"sharpe", "total_return", "cagr", "calmar", "profit_factor", "win_rate", "max_drawdown"}
+)
+
 
 @dataclass
 class Fold:
@@ -77,6 +82,9 @@ def run(
 ) -> WalkForwardResult:
     cost = cost or CostConfig()
     grid = param_grid or {"fast": [10, 20, 30], "slow": [40, 60, 90]}
+    if metric not in VALID_METRICS:
+        # 拼錯 metric 會讓「每組參數都拿哨兵值」→ 第一組永遠勝出，整個 walk-forward 靜默失效
+        raise ValueError(f"metric 必須是 {sorted(VALID_METRICS)} 之一，收到 {metric!r}")
     allowed = set(TrendMA(fast=2, slow=3).params()) & {"fast", "slow", "atr_n", "confirm_days", "trail_atr", "max_weight"}
     bad = set(grid) - allowed
     if bad:
@@ -94,19 +102,27 @@ def run(
 
         is_data = _slice(data, is_start, is_end)
         best, best_metrics = None, None
+        errors: list[str] = []
         for combo in _grid(grid):
             try:
                 strat = TrendMA(**combo, max_positions=max_positions)
                 res = PortfolioBacktester(capital, cost, max_positions).run(
                     is_data, strat, benchmark=None, adj_returns=adj_returns
                 )
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                # 吞掉例外是刻意的（某些參數在某些區間就是不合法），但必須留下痕跡，
+                # 否則「全部失敗」會變成沒有任何線索的空結果
+                errors.append(f"{combo}: {type(e).__name__}: {e}")
                 continue
             score = res.metrics.get(metric, -9e9)
             if best_metrics is None or score > best_metrics.get(metric, -9e9):
                 best, best_metrics = combo, res.metrics
 
         if best is None:
+            if verbose:
+                print(f"  fold {len(folds) + 1}: IS {is_start}~{is_end} 全部參數失敗，跳過")
+                for e in errors[:3]:
+                    print(f"      {e}")
             i += step_days
             continue
 
@@ -128,6 +144,11 @@ def run(
         i += step_days
 
     oos = _aggregate(folds)
+    if not folds:
+        raise ValueError(
+            "沒有任何 fold 成功：可能是交易日不足、參數網格全部不合法，或資料切片後不足 40 天。"
+            "把 --is-days/--os-days 調小或 --start 往前拉再試。"
+        )
     return WalkForwardResult(folds, oos, [f.params for f in folds])
 
 

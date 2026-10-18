@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS meta (
 SETTLE_DAYS = 1
 
 
+def _vol(x) -> int:
+    """成交量轉整數。轉不出來就當 0，但**不要**因此丟掉整根價格 bar。
+
+    FinMind 偶爾回傳 "1,234"、"−"、"" 這類值；價格欄位是好的，只因成交量就
+    讓該交易日消失，會變成一個沒有任何訊息的資料缺口。
+    """
+    if x is None or x == "" or x == "-":
+        return 0
+    if isinstance(x, str):
+        x = x.replace(",", "").strip()
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _today() -> str:
     return dt.date.today().isoformat()
 
@@ -64,29 +80,22 @@ class Store:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def _covered(self, ticker: str, start: str, end: str, adj: bool) -> bool:
-        row = self.db.execute(
-            "SELECT rows FROM fetch_log WHERE ticker=? AND start<=? AND end>=? AND adj=? "
-            "ORDER BY end DESC LIMIT 1",
-            (ticker, start, end, int(adj)),
-        ).fetchone()
-        if not row:
-            return False
-        settled = (dt.date.fromisoformat(end) <= dt.date.today() - dt.timedelta(days=SETTLE_DAYS))
-        return settled or row[0] is not None
-
     def _needs_fetch(self, ticker: str, start: str, end: str, adj: bool, force: bool) -> tuple[bool, bool]:
-        """回傳 (要不要抓價, 要不要抽因子)。因子只補一次，補過就不再打第二次 API。"""
+        """回傳 (要不要抓價, 要不要抽因子)。
+
+        判斷依據只有一個：這段區間有沒有真的入庫過（fetch_log.rows > 0）。
+        不能用「end 是否已定案」當條件 —— 那會讓一次抓失敗（rows=0，例如被限流）
+        在之後每次執行都重打同一段 API，默默吃掉免 token 的 300 req/hr 額度。
+        """
+        if force:
+            return True, True
         adj = bool(adj)
         row = self.db.execute(
             "SELECT rows FROM fetch_log WHERE ticker=? AND start<=? AND end>=? AND adj=? "
             "ORDER BY end DESC LIMIT 1",
             (ticker, start, end, int(adj)),
         ).fetchone()
-        settled = dt.date.fromisoformat(end) <= dt.date.today() - dt.timedelta(days=SETTLE_DAYS)
-        covered = bool(row) and (settled or row[0] is not None)
-        if force:
-            return True, True
+        covered = bool(row) and (row[0] or 0) > 0
         have_factors = self.db.execute(
             "SELECT 1 FROM factors WHERE ticker=? LIMIT 1", (ticker,)
         ).fetchone()
@@ -147,7 +156,7 @@ class Store:
                 out.append((rows[i][0], rows[i - 1][1], rows[i][1]))
         return out
 
-    def upsert_bars(self, ticker: str, rows: list[dict]) -> None:
+    def upsert_bars(self, ticker: str, rows: list[dict]) -> int:
         payload = []
         for r in rows:
             try:
@@ -159,7 +168,7 @@ class Store:
                         float(r["max"]),
                         float(r["min"]),
                         float(r["close"]),
-                        int(r.get("Trading_Volume") or 0),
+                        _vol(r.get("Trading_Volume")),
                     )
                 )
             except (KeyError, TypeError, ValueError):
@@ -169,6 +178,7 @@ class Store:
             payload,
         )
         self.db.commit()
+        return len(payload)
 
     def load_bars(self, ticker: str, start: str, end: str) -> list[tuple]:
         return self.db.execute(
@@ -191,14 +201,16 @@ class Store:
             rows = self.db.execute("SELECT date,close,volume FROM bars WHERE ticker=? ORDER BY date", (t,)).fetchall()
             jumps = []
             zero_vol = 0
-            for i in range(1, len(rows)):
+            for i in range(len(rows)):
+                if (rows[i][2] or 0) <= 0:
+                    zero_vol += 1
+                if i == 0:
+                    continue
                 p, c = rows[i - 1][1], rows[i][1]
                 if p > 0 and c > 0:
                     r = c / p - 1
                     if abs(r) >= jump_threshold:
                         jumps.append({"date": rows[i][0], "from": p, "to": c, "chg": r})
-                if rows[i][2] <= 0:
-                    zero_vol += 1
             if jumps or zero_vol:
                 report[t] = {"rows": len(rows), "jumps": jumps, "zero_volume_days": zero_vol}
         return report

@@ -58,8 +58,19 @@ class Client:
                     body = e.read().decode("utf-8")[:200]
                 except Exception:
                     pass
-                if e.code in (400, 401, 402, 403):
-                    raise FinMindError(f"HTTP {e.code} dataset={dataset}: {body}") from e
+                # 額度用盡有兩種表達方式：body 的 status 欄位，或直接回 HTTP 402/403。
+                # 兩種都要轉成 QuotaExceeded，不然 CLI 只會印一句泛用錯誤，
+                # 使用者拿不到「設 FINMIND_TOKEN」這個唯一有用的提示。
+                if e.code in (401, 402, 403):
+                    raise QuotaExceeded(f"HTTP {e.code} dataset={dataset}: {body}") from e
+                if e.code == 429:
+                    # 已經被限流就別再補槍；尊重 Retry-After
+                    wait = float(e.headers.get("Retry-After") or self.pause * (attempt + 2))
+                    time.sleep(min(max(wait, 0.0), 60.0))
+                    last_err = e
+                    continue
+                if e.code == 400:
+                    raise FinMindError(f"HTTP 400 dataset={dataset}: {body}") from e
                 last_err = e
             except Exception as e:  # noqa: BLE001 - 網路層什麼都可能
                 last_err = e

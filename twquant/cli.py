@@ -58,12 +58,25 @@ _STRATEGY_KEYS = {
 
 
 def _tickers(a) -> list[str]:
-    if a.tickers:
-        return [t.strip() for t in a.tickers.split(",") if t.strip()]
+    if a.tickers is not None:
+        # 空字串是「使用者明確給了清單但清單是空的」，不是「沒填」，不該靜默換成預設宇宙
+        picked = [t.strip() for t in a.tickers.split(",") if t.strip()]
+        if not picked:
+            raise SystemExit("--tickers 是空的：要嘛不要給，要嘛給至少一檔（例如 --tickers 2330,2317）")
+        return picked
     if a.etf:
         return [INDEX_REF, "006208", "0056", "00878", "00713", "2330", "2308", "2412", "2884", "1301"]
     # 交易宇宙 + 基準 ETF，兩者都抓才能算超額報酬
     return [*DEFAULT_UNIVERSE, INDEX_REF, "006208"]
+
+
+def _trade_universe(data: dict) -> dict:
+    """把基準 ETF 從交易宇宙剔除。
+
+    sweep 與 walkforward 一定要跟 backtest 用同一個宇宙，
+    否則同一組參數在兩邊會給出不同績效，而且策略可以買賣自己的基準。
+    """
+    return {t: v for t, v in data.items() if t not in INDEX_TICKERS}
 
 
 def cmd_fetch(a) -> int:
@@ -91,6 +104,12 @@ def _bench_of(a, data) -> str | None:
         return None
     if want and want in data:
         return want
+    if want:
+        print(
+            f"  警告：基準 {want} 不在本次載入的資料裡（用 --tickers 指定時不會自動補基準），"
+            f"改用 {'/'.join(t for t in BENCH_PREF if t in data) or '等權買進持有'}",
+            file=sys.stderr,
+        )
     for t in BENCH_PREF:
         if t in data:
             return t
@@ -105,10 +124,11 @@ def _run_backtest(a) -> tuple:
         return None, None, None
     strat = build(a.strategy, max_positions=a.max_positions, **_strategy_kwargs(a))
     bt = PortfolioBacktester(a.cash, _cost(a), a.max_positions)
-    universe = {t: v for t, v in data.items() if t not in INDEX_TICKERS}
-    adj_u = {t: v for t, v in adj.items() if t not in INDEX_TICKERS}
+    # 交易宇宙要剔除基準 ETF，但基準本身仍要留在資料裡，否則算不出超額報酬
     bench = _bench_of(a, data)
-    res = bt.run(universe or data, strat, benchmark=bench, progress=a.verbose, adj_returns=adj_u)
+    tradable = _trade_universe(data) or data
+    res = bt.run(tradable, strat, benchmark=bench, progress=a.verbose, adj_returns=adj,
+                 benchmark_data=data if bench else None)
     return res, data, tickers
 
 
@@ -159,6 +179,7 @@ def cmd_sweep(a) -> int:
     if not data:
         print("本地沒有資料，先跑 fetch", file=sys.stderr)
         return 1
+    universe = _trade_universe(data) or data
 
     combos = [{}]
     for k, vals in grid.items():
@@ -169,13 +190,13 @@ def cmd_sweep(a) -> int:
     for combo in combos:
         strat = build(a.strategy, max_positions=a.max_positions, **combo)
         res = PortfolioBacktester(a.cash, _cost(a), a.max_positions).run(
-            data, strat, benchmark=bench, adj_returns=adj
+            universe, strat, benchmark=bench, adj_returns=adj
         )
         m = res.metrics
         rows.append((m["sharpe"], m["cagr"], m["max_drawdown"], m["trades"], m["win_rate"], combo, m["total_return"]))
 
     rows.sort(key=lambda r: -r[0])
-    print(f"\n  {a.strategy} 參數掃描，{len(rows)} 組，依 Sharpe 排序（{len(data)} 檔標的）\n")
+    print(f"\n  {a.strategy} 參數掃描，{len(rows)} 組，依 Sharpe 排序（{len(universe)} 檔標的）\n")
     print(f"  {'Sharpe':>8}{'CAGR':>10}{'MDD':>9}{'筆數':>7}{'勝率':>8}{'總報酬':>10}   參數")
     for s, c, d, n, w, combo, tot in rows[: a.top]:
         print(f"  {s:>8.2f}{c * 100:>9.1f}%{d * 100:>8.1f}%{n:>7}{w * 100:>7.1f}%{tot * 100:>9.1f}%   {combo}")
@@ -203,7 +224,7 @@ def cmd_walkforward(a) -> int:
                     vals.append(float(x))
             grid[k] = vals
     res = wf.run(
-        data,
+        _trade_universe(data) or data,
         a.start,
         end,
         is_days=a.is_days,
@@ -399,7 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--is-days", dest="is_days", type=int, default=756)
     w.add_argument("--os-days", dest="os_days", type=int, default=252)
     w.add_argument("--step", type=int, default=252)
-    w.add_argument("--metric", default="sharpe")
+    w.add_argument("--metric", default="sharpe", choices=sorted(wf.VALID_METRICS))
     w.add_argument("--grid", action="append", help="例：--grid fast=10,20,30")
     w.add_argument("--json", action="store_true")
     w.set_defaults(func=cmd_walkforward)

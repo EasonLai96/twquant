@@ -1,7 +1,7 @@
 """twquant — 台股量化回測工具包（零外部依賴）。"""
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .engine import CostConfig, PortfolioBacktester, Trade
 from .loader import DEFAULT_UNIVERSE, Bar, load_bars, load_universe

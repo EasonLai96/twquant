@@ -200,23 +200,21 @@ def markdown_report(res: BacktestResult, image_rel: str | None = None) -> str:
     if image_rel:
         out += [f"![權益曲線]({image_rel})", ""]
     if b:
-        out += ["## 績效", "", "| 指標 | 值 | 指標 | 值 |", "|---|---|---|---|"]
+        out += ["## 績效", "", f"**基準：{res.benchmark_label}**（buy & hold，期初同額投入）", "",
+                "| 指標 | 策略 | 基準 |", "|---|---|---|"]
+        # 用指標名稱配對，不用索引對齊 —— 索引對齊只要 rows 增減一項就會整欄位移
+        bench_cells = {
+            "總報酬": pct(b.get("total_return", 0)),
+            "CAGR": pct(b.get("cagr", 0)),
+            "最大回撤": pct(b.get("max_drawdown", 0)),
+            "年化波動": pct(b.get("vol", 0)),
+            "Sharpe (rf=2%)": f"{b.get('sharpe', 0):.2f}",
+        }
+        for k, v in rows:
+            out.append(f"| {k} | {v} | {bench_cells.get(k, '')} |")
     else:
         out += ["## 績效", "", "| 指標 | 值 |", "|---|---|"]
-    brows = [
-        (f"基準 {res.benchmark_label}", ""),
-        ("基準總報酬", pct(b.get("total_return", 0))),
-        ("基準 CAGR", pct(b.get("cagr", 0))),
-        ("基準最大回撤", pct(b.get("max_drawdown", 0))),
-        ("基準 Sharpe", f"{b.get('sharpe', 0):.2f}"),
-        ("超額報酬", pct(m["total_return"] - b.get("total_return", 0))),
-        ("", ""),
-    ] if b else []
-    for i, (k, v) in enumerate(rows):
-        if b:
-            bk, bv = brows[i] if i < len(brows) else ("", "")
-            out.append(f"| {k} | {v} | {bk} | {bv} |")
-        else:
+        for k, v in rows:
             out.append(f"| {k} | {v} |")
     out += [
         "",

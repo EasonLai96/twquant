@@ -18,6 +18,8 @@ class OrderIntent:
     ticker: str
     action: str  # buy | sell
     reason: str = ""
+    # sell 時可指定股數做部分出場；None 表示整筆清掉
+    shares: int | None = None
 
 
 @dataclass(slots=True)
