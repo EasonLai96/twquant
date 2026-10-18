@@ -1,5 +1,10 @@
 # twquant — 台股量化回測工具包
 
+[![tests](https://github.com/EasonLai96/twquant/actions/workflows/tests.yml/badge.svg)](https://github.com/EasonLai96/twquant/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
+
 零外部依賴（只吃 Python 3.11+ 標準庫），資料源用 [FinMind](https://finmind.github.io/)，落地 SQLite 快取。
 目標不是給你一組會賺錢的參數，是給你一個**不會騙你**的回測環境。
 
@@ -35,7 +40,7 @@ python -m twquant backtest --strategy trend_ma --fast 20 --slow 60
 不需要 `pip install` 任何東西：
 
 ```bash
-git clone <本專案的 GitHub 網址>
+git clone https://github.com/EasonLai96/twquant.git
 cd twquant
 python -m twquant --help
 ```
