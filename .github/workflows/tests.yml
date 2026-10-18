@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 確認沒有任何外部依賴
+        run: |
+          python - <<'PY'
+          import tomllib, pathlib
+          deps = tomllib.loads(pathlib.Path("pyproject.toml").read_text("utf-8"))["project"].get("dependencies", [])
+          assert deps == [], f"這個專案宣稱零依賴，但宣告了 {deps}"
+          print("dependencies = [] OK")
+          PY
+      - name: 單元測試
+        run: python -m unittest discover -s tests -t . -v
+      - name: 合成資料 demo（不碰網路）
+        run: python examples/demo.py
+      - name: CLI 冒煙測試
+        run: |
+          python -m twquant --help
+          python -m twquant backtest --help
+          python -m twquant doctor --jump 0.3

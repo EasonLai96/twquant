@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twquant"
+version = "0.1.0"
+description = "台股量化回測工具包 — 零外部依賴、把台股真實摩擦建模進去的 backtester"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "twquant contributors" }]
+keywords = ["taiwan", "stock", "backtest", "quant", "trading", "twse", "finmind"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Natural Language :: Chinese (Traditional)",
+]
+dependencies = []
+
+[project.scripts]
+twquant = "twquant.cli:main"
+
+[tool.setuptools]
+packages = ["twquant"]

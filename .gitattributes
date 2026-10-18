@@ -1,0 +1,8 @@
+# 跨平台一致：CI 跑 Linux，這裡不讓 Windows 的 CRLF 進版控
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.sqlite binary

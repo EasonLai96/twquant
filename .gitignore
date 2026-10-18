@@ -1,0 +1,12 @@
+# FinMind token 不要進版控
+.env
+
+# 抓下來的資料與報表
+data/
+out/
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
