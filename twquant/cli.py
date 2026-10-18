@@ -487,6 +487,47 @@ def cmd_live_tune(a) -> int:
     return 0
 
 
+def cmd_bench(a) -> int:
+    """躺著 vs 動手：同一段時間、同一組成本，把幾種做法攤開比。"""
+    from .bench import HEADER, run_bench
+
+    end = a.end or dt.date.today().isoformat()
+    tickers = _tickers(a)
+    if a.benchmark not in tickers:
+        tickers = [*tickers, a.benchmark]
+    data, adj = _load(a, tickers)
+    if not data:
+        print("本地沒有資料，先跑 fetch", file=sys.stderr)
+        return 1
+
+    rows = run_bench(
+        data, a.benchmark, a.cash, _cost(a),
+        start=a.start, end=end, adj_returns=adj, max_positions=a.max_positions,
+    )
+    if not rows:
+        print("沒有可比較的資料", file=sys.stderr)
+        return 1
+
+    print(f"\n  {a.start} ~ {end}   本金 {a.cash:,.0f}   全部扣同樣成本\n")
+    print(HEADER)
+    for r in rows:
+        print(r.row())
+
+    base = next((r for r in rows if r.name == "buyhold"), None)
+    if base:
+        print()
+        for r in rows:
+            if r.name == "buyhold":
+                continue
+            print(
+                f"  {r.name:<10} 相對 buyhold {r.total_return - base.total_return:+.1%}"
+                f"   Sharpe {r.sharpe:+.2f} vs {base.sharpe:+.2f}"
+                f"   回撤 {r.max_drawdown:.0%} vs {base.max_drawdown:.0%}"
+            )
+    print()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="twquant", description="台股量化回測工具（零依賴）")
     p.add_argument("--version", action="version", version=f"twquant {__version__}")
@@ -599,6 +640,11 @@ def build_parser() -> argparse.ArgumentParser:
     lt.add_argument("--cooldown", type=int, default=30, help="距上次調參幾天內不再調")
     lt.add_argument("--force", action="store_true", help="跳過冷卻期")
     lt.set_defaults(func=cmd_live_tune)
+
+    bm = sub.add_parser("bench", help="躺著 vs 動手：跟買進持有／定期定額對照")
+    common(bm)
+    bm.add_argument("--benchmark", default="0050", help="對照用的指數 ETF")
+    bm.set_defaults(func=cmd_bench)
 
     sv = sub.add_parser("serve", help="把 out/ 用 HTTP 開出來看 SVG")
     sv.add_argument("--port", type=int, default=8899)
