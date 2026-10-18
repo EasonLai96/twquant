@@ -283,5 +283,79 @@ class DirtyDataTest(unittest.TestCase):
         self.assertTrue(res.snapshots)
 
 
+class AddThenExitConsistency(unittest.TestCase):
+    """加碼之後平倉。
+
+    entry_price 只在「新建部位」的分支被設定，加碼分支只更新 cost。
+    而平倉損益用的是 (px - entry_price)，於是整個部位（含加碼的股數）
+    都用「第一次買進價」結算 —— 損益虛增，而且虛增幅度剛好等於
+    Σ 加碼股數 × (第一次買價 − 該批真實成交價)。
+    """
+
+    def _run(self, weight_late: float = 0.9):
+        prices = [100.0 + i for i in range(140)]
+        bars = mk_bars(prices)
+
+        class AddThenExit:
+            name = "add_then_exit"
+
+            def params(self):
+                return {}
+
+            def on_bar(self, ctx):
+                if ctx.idx >= 100:
+                    return StrategyResponse(orders=[OrderIntent("ASSET", "sell", "exit")], allocation={})
+                if ctx.idx == 60:
+                    return StrategyResponse(allocation={"ASSET": 0.25})
+                if ctx.idx == 80:
+                    # 拉高權重會讓引擎發出 'add' 單，走上加碼分支
+                    return StrategyResponse(allocation={"ASSET": weight_late})
+                if ctx.idx > 60:
+                    return StrategyResponse(allocation={"ASSET": 0.25})
+                return StrategyResponse()
+
+        bt = PortfolioBacktester(1_000_000, CostConfig(), max_positions=1)
+        return bt.run({"ASSET": bars}, AddThenExit(), benchmark=None)
+
+    def test_add_path_is_actually_exercised(self):
+        """先確認這個測試真的會走到加碼分支，否則它只是在測別的東西。"""
+        res = self._run()
+        buys = [t for t in res.trades]
+        self.assertTrue(buys, "應該有平倉紀錄")
+        # 部位應在 60 進場、80 加碼，所以最終持股大於單次進場能買到的量
+        self.assertGreater(res.trades[0].shares, 1000 * 2, "加碼單沒有成交，這個測試失去意義")
+
+    def test_add_then_exit_pnl_matches_equity(self):
+        res = self._run()
+        equity_delta = res.metrics["final"] - res.metrics["initial"]
+        pnl_sum = sum(t.pnl for t in res.trades)
+
+        self.assertEqual(max(s.holdings for s in res.snapshots) > 0, True)
+        self.assertAlmostEqual(
+            res.snapshots[-1].holdings, 0.0, places=6, msg="最後應該完全空手，否則等式不能用"
+        )
+        self.assertAlmostEqual(
+            pnl_sum,
+            equity_delta,
+            delta=2.0,
+            msg=(
+                f"加碼後平倉：交易損益總和 {pnl_sum:,.2f} 與權益變化 {equity_delta:,.2f} 不一致"
+                f"（差 {pnl_sum - equity_delta:,.2f}）"
+            ),
+        )
+
+    def test_entry_price_is_weighted_average(self):
+        """進場價必須是加權平均成交價，不能停在第一次買進的價格。"""
+        res = self._run()
+        trade = res.trades[0]
+        # 價格從 100 一路漲到 240，加碼在 80 附近（約 180 元）。
+        # 若 entry_price 停在第一次買價（約 160），會明顯低於加碼後的真實均價。
+        self.assertGreater(
+            trade.entry_price,
+            170,
+            f"entry_price {trade.entry_price:.2f} 看起來是第一次買進價，不是加權平均",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

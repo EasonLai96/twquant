@@ -416,6 +416,10 @@ class PortfolioBacktester:
                         p.shares += shares
                         p.cost = total / p.shares
                         p.entry_fee += fee
+                        # entry_price 是不含費的加權平均成交價。
+                        # 不跟著更新的話，平倉時 (px - entry_price) 會拿「第一次買進價」
+                        # 結算含加碼在內的整個部位，損益與 win_rate / profit_factor 全部虛增。
+                        p.entry_price = (p.cost * p.shares - p.entry_fee) / p.shares
                 else:
                     positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, fee)
         return cash
