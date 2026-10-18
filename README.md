@@ -13,7 +13,7 @@ python -m twquant backtest --strategy trend_ma --fast 20 --slow 60
 
 ## 先講清楚這包的狀態
 
-50 個單元測試、CI 跑 3.11/3.12/3.13、11 年真實台股資料端到端跑過。另外做過兩輪獨立的
+54 個單元測試、CI 跑 3.11/3.12/3.13、11 年真實台股資料端到端跑過。另外做過兩輪獨立的
 對抗式複核，修掉 18 個 bug——那些 bug 的共同點是不會丟例外，回測照樣跑完、報表照樣產出，
 只有數字是錯的。細節在 [CHANGELOG](CHANGELOG.md)，每個都有回歸測試。
 
@@ -92,6 +92,9 @@ python -m twquant walkforward --start 2015-01-01 --end 2026-10-17
 | `walkforward` | 滾動 IS/OS 驗證 |
 | `universe` | 看本地快取了哪些標的、日均量多少 |
 | `serve` | 把 `out/` 用 HTTP 開出來看圖 |
+| `live` | 實單／模擬單主迴圈，含風控與稽核 |
+| `live-status` | 看持股、參數、最近委託 |
+| `live-tune` | 參數重訓（有冷卻期與樣本外門檻） |
 
 ## 台股摩擦怎麼建模
 
@@ -147,8 +150,11 @@ twquant/
 │   ├── engine.py       回測引擎（成本、漲跌停、整股、權益快照、績效指標）
 │   ├── walkforward.py  滾動 IS/OS 驗證
 │   ├── report.py       終端摘要、Markdown、手刻 SVG
-│   └── cli.py          命令列
-└── tests/              50 個測試，合成資料，不碰網路
+│   ├── cli.py          命令列
+│   ├── broker.py       券商介面
+│   ├── paper.py        PaperBroker（重播歷史資料）
+│   └── live/           主迴圈、風控、狀態、盤中監控、調參
+└── tests/              54 個測試，合成資料，不碰網路
 ```
 
 `python -m unittest discover -s tests -t .`
@@ -158,6 +164,45 @@ twquant/
 
 最後一項不是客套。開發過程中 `_idx()` 和 `_prev_bar()` 各有一個 off-by-one，症狀是
 「回測跑完 0 筆交易」和「漲跌停判斷永遠失效」，兩個都不會丟例外。它們現在各有專門的測試。
+
+## 自動下單
+
+`live` 是實單／模擬單的主迴圈。預設用 PaperBroker 重播已快取的資料，不需要券商 credentials。
+
+```bash
+python -m twquant live --strategy trend_ma --fast 20 --slow 60 --start 2019-01-01
+python -m twquant live-status          # 看持股、參數、最近委託
+python -m twquant live --stop "手動停止"   # 寫入 HALT，立刻停止下單
+python -m twquant live --resume          # 解除 HALT
+```
+
+迴圈順序固定是：券商撮合 → 查部位 → 風控 → 策略 → 下單。部位一律跟券商查，不自己記，
+因為自己記的版本遲早會跟券商不同步。
+
+**風控分兩層，這點很重要。** hard 才真的停手：單日虧損超限、HALT 檔存在、連續多天無法下單。
+soft 只擋新倉：單檔佔比超標、總曝險超標、持股檔數超標。如果把 soft 也當成 hard，
+會出現「部位漲太多所以永遠停止下單」的死結，而停止下單完全不會讓部位變小 ——
+這是實單自動化最容易踩的坑，我自己第一版就踩了。
+
+參數重訓預設有冷卻期與樣本外門檻：
+
+```bash
+python -m twquant live-tune --grid fast=10,20,30 --grid slow=40,60,90
+```
+
+三道閘門全過才會換參數：fold 數 >= 3、樣本外 Sharpe >= 0、IS-OS 落差 <= 15%。
+沒過就維持原參數。沒有閘門的自動調參長期比固定參數更差，因為 walk-forward 本身就會過擬合，
+拿它去自動改參數等於把過擬合直接變成虧損。
+
+### 為什麼可以信這條路徑
+
+`tests/test_live.py` 拿同一份資料、同一組參數，跑回測引擎與 PaperBroker，
+要求**逐筆交易的日期、標的、股數、成交價完全相同**，成本總和也要對得上。
+兩個實作各自通過自己的測試並不代表它們算的是同一件事，只有對帳能證明。
+
+這個測試在開發過程中抓到三個 bug，每一個都會讓實單直接虧錢：傳給策略的 bar 不是
+「到今天為止」的視窗（訊號永遠不成立）、暖機不足（61 根以下算不出均線）、
+風控收到的價格表只有已持有標的（新倉永遠被判無報價而丟掉）。
 
 ## 已知限制
 

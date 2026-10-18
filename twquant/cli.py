@@ -352,6 +352,141 @@ def cmd_doctor(a) -> int:
     return 0
 
 
+def cmd_live(a) -> int:
+    """模擬單／實單主迴圈。預設用 PaperBroker 重播已快取的資料。"""
+    from .broker import BrokerError
+    from .live.risk import RiskLimits
+    from .live.runner import LiveRunner
+    from .paper import PaperBroker
+
+    if a.stop:
+        from .live.risk import RiskGate
+
+        gate = RiskGate(state_dir=a.state)
+        print(f"已寫入 HALT（{gate.state_dir / 'HALT'}）" if gate.halt(a.stop) is None else "")
+        print(f"停止下單：{a.stop}")
+        return 0
+    if a.resume:
+        from .live.risk import RiskGate
+
+        ok = RiskGate(state_dir=a.state).resume()
+        print("已解除 HALT" if ok else "沒有 HALT 檔")
+        return 0
+
+    if a.broker != "paper":
+        print(f"目前只支援 paper，{a.broker} adapter 尚未實作", file=sys.stderr)
+        return 2
+
+    end = a.end or dt.date.today().isoformat()
+    tickers = _tickers(a)
+    data, adj = _load(a, tickers)
+    if not data:
+        print("本地沒有資料，先跑 fetch", file=sys.stderr)
+        return 1
+    tradable = _trade_universe(data) or data
+
+    cost = _cost(a)
+    strat = build(a.strategy, max_positions=a.max_positions, **_strategy_kwargs(a))
+    # 風控的單檔上限要比策略的目標權重寬一點，否則正常波動就會一直觸發攔阻
+    strat_w = float(strat.params().get("max_weight", 0.25))
+    limits = RiskLimits(
+        max_positions=a.max_positions,
+        max_weight=getattr(a, "max_weight", None) or round(strat_w * 1.2, 4),
+        max_exposure=a.max_exposure,
+        daily_loss_limit=a.daily_loss_limit,
+    )
+    broker = PaperBroker(tradable, capital=a.cash, cost=cost, adj_returns=adj)
+
+    print(f"\n  PaperBroker  {len(tradable)} 檔  本金 {a.cash:,.0f}  成本模型同回測")
+    print(f"  風控 單檔上限 {limits.max_weight * 100:.0f}%  總曝險 {limits.max_exposure * 100:.0f}%"
+          f"  單日虧損 {limits.daily_loss_limit * 100:.1f}%  持股 {limits.max_positions} 檔")
+    print(f"  狀態 {Path(a.state).resolve()}\n")
+
+    runner = LiveRunner(
+        broker, strat, tradable, state_dir=a.state, capital=a.cash,
+        cost=cost, limits=limits, adj_returns=adj, verbose=not a.quiet, sleep=a.sleep,
+    )
+    rep = runner.run(start=a.start, end=end, max_days=a.days)
+    print()
+    print(rep.summary())
+    print(f"\n  稽核紀錄 {runner.state.events_path}")
+    runner.state.close()
+    return 0
+
+
+def cmd_live_status(a) -> int:
+    from .live.state import State
+
+    st = State(a.state)
+    print(f"\n  狀態目錄 {Path(a.state).resolve()}")
+    print(f"  最後交易日 {st.get_meta('last_date') or '(未跑過)'}")
+    params = st.get_meta("params")
+    print(f"  目前參數 {params or '(預設)'}")
+    pos = st.load_positions()
+    print(f"\n  持股 {len(pos)} 檔")
+    for p in pos:
+        print(f"    {p['ticker']:<8} {p['shares']:>8,} 股  成本 {p['cost_basis']:,.0f}  進場 {p['entry_date']}")
+    last_tune = st.get_meta("last_tune_date")
+    print(f"\n  上次調參 {last_tune or '(從未)'}")
+    orders = st.orders(10)
+    if orders:
+        print("\n  最近委託")
+        for o in orders:
+            print(f"    {o['ts']:<12} {o['ticker']:<8} {o['side']:<5} {o['shares']:>7,} "
+                  f"{o['status']:<9} {o['reason']:<12} {o['message']}")
+    st.close()
+    print()
+    return 0
+
+
+def cmd_live_tune(a) -> int:
+    """參數重訓。預設會檢查冷卻期與樣本外門檻，沒過就不換。"""
+    from .live.risk import RiskGate
+    from .live.state import State
+    from .live.tuner import TuneGate, tune
+
+    if RiskGate(state_dir=a.state).halted:
+        print("偵測到 HALT，先解除再調參", file=sys.stderr)
+        return 2
+
+    end = a.end or dt.date.today().isoformat()
+    tickers = _tickers(a)
+    data, adj = _load(a, tickers)
+    if not data:
+        print("本地沒有資料，先跑 fetch", file=sys.stderr)
+        return 1
+    tradable = _trade_universe(data) or data
+
+    st = State(a.state)
+    current = st.get_meta("params") or build(a.strategy, max_positions=a.max_positions).params()
+    grid = None
+    if a.grid:
+        grid = {}
+        for spec in a.grid:
+            k, v = spec.split("=", 1)
+            vals = []
+            for x in v.split(","):
+                try:
+                    vals.append(int(x))
+                except ValueError:
+                    vals.append(float(x))
+            grid[k] = vals
+
+    res = tune(
+        tradable, st, current, a.start, end,
+        capital=a.cash, cost=_cost(a), gate=TuneGate(
+            min_folds=a.min_folds, min_os_sharpe=a.min_os_sharpe,
+            max_is_os_gap=a.max_gap, cooldown_days=a.cooldown,
+        ),
+        param_grid=grid, adj_returns=adj, max_positions=a.max_positions, force=a.force,
+    )
+    print()
+    print(res.summary())
+    print()
+    st.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="twquant", description="台股量化回測工具（零依賴）")
     p.add_argument("--version", action="version", version=f"twquant {__version__}")
@@ -434,6 +569,36 @@ def build_parser() -> argparse.ArgumentParser:
     common(d)
     d.add_argument("--jump", type=float, default=0.3, help="單日跳動超過幾成要列出來（0.3 = 30%%）")
     d.set_defaults(func=cmd_doctor)
+
+    lv = sub.add_parser("live", help="模擬單／實單主迴圈（含風控與稽核）")
+    common(lv)
+    strat_args(lv)
+    lv.add_argument("--broker", default="paper", choices=["paper"], help="目前只支援 paper")
+    lv.add_argument("--state", default="state/live", help="狀態與稽核紀錄目錄")
+    lv.add_argument("--days", type=int, default=None, help="最多跑幾個交易日（除錯用）")
+    lv.add_argument("--max-exposure", dest="max_exposure", type=float, default=1.0)
+    lv.add_argument("--daily-loss-limit", dest="daily_loss_limit", type=float, default=0.05)
+    lv.add_argument("--quiet", action="store_true")
+    lv.add_argument("--sleep", type=float, default=0.0, help="每盤之間停幾秒（實單用）")
+    lv.add_argument("--stop", default=None, metavar="REASON", help="寫入 HALT 停止下單")
+    lv.add_argument("--resume", action="store_true", help="解除 HALT")
+    lv.set_defaults(func=cmd_live)
+
+    ls = sub.add_parser("live-status", help="看實單狀態、持股與最近委託")
+    ls.add_argument("--state", default="state/live")
+    ls.set_defaults(func=cmd_live_status, db=DEFAULT_DB, out=DEFAULT_OUT)
+
+    lt = sub.add_parser("live-tune", help="參數重訓（有冷卻期與樣本外門檻，沒過不換）")
+    common(lt)
+    strat_args(lt)
+    lt.add_argument("--state", default="state/live")
+    lt.add_argument("--grid", action="append", help="例：--grid fast=10,20,30")
+    lt.add_argument("--min-folds", dest="min_folds", type=int, default=3)
+    lt.add_argument("--min-os-sharpe", dest="min_os_sharpe", type=float, default=0.0)
+    lt.add_argument("--max-gap", dest="max_gap", type=float, default=0.15)
+    lt.add_argument("--cooldown", type=int, default=30, help="距上次調參幾天內不再調")
+    lt.add_argument("--force", action="store_true", help="跳過冷卻期")
+    lt.set_defaults(func=cmd_live_tune)
 
     sv = sub.add_parser("serve", help="把 out/ 用 HTTP 開出來看 SVG")
     sv.add_argument("--port", type=int, default=8899)

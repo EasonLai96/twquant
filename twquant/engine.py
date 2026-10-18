@@ -259,49 +259,54 @@ class PortfolioBacktester:
 
     # --- 訂單規劃 -------------------------------------------------------------
 
-    def _plan(
+    def plan_orders(
         self,
         resp,
-        positions: dict[str, Position],
+        held: dict[str, int],
         today: dict[str, Bar],
         equity: float,
         cash: float,
         min_vol: dict[str, float],
-        bars_of: dict[str, dict[str, Bar]],
+        bars_of: dict[str, list[Bar]],
         idx_of: dict[str, dict[str, int]],
         date: str,
         day_no: int,
     ) -> list[dict]:
+        """把策略的 StrategyResponse 轉成具體訂單。
+
+        回測與實單共用這一段，才不會兩邊的配置邏輯各自漂移。
+        held 只放「目前持股數」，不需要完整的部位物件。
+        """
         orders: list[dict] = []
         intents = {o.ticker: o for o in resp.orders}
         sells = {t for t, o in intents.items() if o.action == "sell"}
         keep = set(resp.allocation) | sells
 
-        # 清倉：持有但沒被列入 allocation。這輪已經處理過的 ticker 不再進第二次，
-        # 否則「清倉 + 策略明確賣出」會產生兩筆同樣的賣單（實單會變成重複委託）
+        # 清倉：持有但沒被列入 allocation。已經處理過的 ticker 不再進第二次，
+        # 否則「清倉 + 策略明確賣出」會產生兩筆同樣的賣單（實單就是重複委託）
         handled: set[str] = set()
-        for t, p in positions.items():
-            if t not in keep and p.shares > 0:
-                orders.append({"side": "sell", "ticker": t, "shares": p.shares, "reason": "rebalance"})
+        for t, sh in held.items():
+            if t not in keep and sh > 0:
+                orders.append({"side": "sell", "ticker": t, "shares": sh, "reason": "rebalance"})
                 handled.add(t)
         for t in sells:
             if t in handled:
                 continue
-            p = positions.get(t)
-            if not p or p.shares <= 0:
+            sh = held.get(t, 0)
+            if sh <= 0:
                 continue
             want = intents[t].shares
             if want is None:
-                want = p.shares
+                want = sh
             # 部分出場要湊整張，湊不出來就清掉，避免留下無法處理的零股
-            shares = min(p.shares, (max(want, 0) // self.cost.lot) * self.cost.lot)
+            shares = min(sh, (max(want, 0) // self.cost.lot) * self.cost.lot)
             if shares < self.cost.lot:
-                shares = p.shares
+                shares = sh
             orders.append(
                 {"side": "sell", "ticker": t, "shares": shares, "reason": intents[t].reason or "signal"}
             )
 
-        free = max(self.max_positions - len([t for t in positions if t not in sells]), 0)
+        free = max(self.max_positions - len([t for t in held if t not in sells and held[t] > 0]), 0)
         targets = {t: w for t, w in resp.allocation.items() if w > 0}
         for t, w in targets.items():
             bars = bars_of.get(t)
@@ -315,14 +320,12 @@ class PortfolioBacktester:
             prev = bars_of[t][i]
             if prev.close <= 0:
                 continue
-            held = positions[t].shares if t in positions else 0
+            have = held.get(t, 0)
             budget = equity * w
             if budget <= 0:
                 continue
-            if held > 0:
-                current = held * prev.close
-                if prev.close <= 0:
-                    continue
+            if have > 0:
+                current = have * prev.close
                 delta = int((budget - current) / prev.close / self.cost.lot) * self.cost.lot
                 if delta >= self.cost.lot:
                     orders.append({"side": "buy", "ticker": t, "shares": delta, "reason": "add"})
@@ -337,6 +340,23 @@ class PortfolioBacktester:
                     orders.append({"side": "buy", "ticker": t, "shares": lots * self.cost.lot, "reason": "entry"})
                     free -= 1
         return orders
+
+    def _plan(
+        self,
+        resp,
+        positions: dict[str, Position],
+        today: dict[str, Bar],
+        equity: float,
+        cash: float,
+        min_vol: dict[str, float],
+        bars_of: dict[str, dict[str, Bar]],
+        idx_of: dict[str, dict[str, int]],
+        date: str,
+        day_no: int,
+    ) -> list[dict]:
+        """把目前持股攤平成 ticker -> shares，交給共用的 plan_orders。"""
+        held = {t: p.shares for t, p in positions.items() if p.shares > 0}
+        return self.plan_orders(resp, held, today, equity, cash, min_vol, bars_of, idx_of, date, day_no)
 
     # --- 成交 -----------------------------------------------------------------
 
