@@ -39,13 +39,11 @@ class Position:
     shares: int
     entry_date: str
     last_close: float
-    # 現金成本（含買進手續費）。這是損益的唯一權威來源 —— 現金流出多少就是多少。
-    # 分割/減資不改變這個數字（你付出的現金沒變），改的是股數。
+    # 含買進手續費的現金成本。分割只換算股數，不動這個數字。
     cash_cost: float
 
     @property
     def cost_per_share(self) -> float:
-        """每股綜合成本（含費），給報表看的。分割後股數變多，這個數字會跟著降。"""
         return self.cash_cost / self.shares if self.shares else 0.0
 
 
@@ -54,11 +52,10 @@ def _finite(x: float) -> bool:
 
 
 def is_rebase_date(adj_returns, ticker: str, date: str, prev_close: float, close: float) -> bool:
-    """這一天是不是「重新定價日」（分割/減資/除權息）。
+    """這天是不是分割/減資的重新定價日。
 
-    判定：adj_returns 明確標記為 0（loader 的結構性斷點訊號），
-    但原始價格其實有明顯變動 —— 那就代表價格被換了基準，而不是真的漲跌停。
-    沒有 adj_returns 時回 False（合成資料或非 FinMind 來源不走這條路）。
+    loader 會把結構性斷點標成報酬 0；原始價又動了很大的幅度，就是價格換了基準，
+    不是真的漲跌停。沒有 adj_returns 就一律當成正常交易日。
     """
     if adj_returns is None:
         return False
@@ -210,16 +207,7 @@ class PortfolioBacktester:
                 cash = self._execute_orders(pending, positions, today, bars_of, cash, trades, costs, adj_returns)
                 pending = []
 
-            # 2) 收盤後評價
-            #
-            # 全部留在「原始價格座標」：last_close = 當日原始收盤，市值 = 股數 × 原始價。
-            # 分割/減資（價格被重新定價）不換算價格，而是換算「股數」——
-            # 4:1 分割就是把 4000 股變成 16000 股，現金成本不變（你付出的現金沒變）。
-            #
-            # 這樣做的理由：換算價格會讓「市值座標」與「賣出收入座標」分家，
-            # 平倉時就會出現假虧損或假獲利，而 _plan 用原始價算部位市值、卻和
-            # 換算過的 equity 相比，還會誤加碼把權益灌爆。
-            # 換算股數則讓市值、賣出、損益、配置全部同一個座標，不需要任何特例。
+            # 2) 收盤後評價。分割/減資換算股數，不換算價格
             holdings_val = 0.0
             for p in positions.values():
                 b = today.get(p.ticker)
@@ -228,8 +216,7 @@ class PortfolioBacktester:
                     if prev_close is not None and is_rebase_date(adj_returns, p.ticker, d, prev_close.close, b.close):
                         k = prev_close.close / b.close
                         if _finite(k) and k > 0 and abs(k - 1.0) > 1e-9:
-                            # 股數換算，現金成本不動。畸零股（分割比例不是整數時必然出現）
-                            # 留給後續平倉的 frac 分攤吸收，不會漏價值。
+                            # 畸零股（分割比例非整數時）由後續平倉的 frac 分攤吸收
                             p.shares = int(round(p.shares * k))
                     p.last_close = b.close
                 holdings_val += p.shares * p.last_close
@@ -435,14 +422,13 @@ class PortfolioBacktester:
         return cash
 
     def _tradable(self, bar: Bar, prev_close: float, side: str, is_rebase: bool = False) -> tuple[bool, str]:
-        """判斷這根 bar 的開盤價能不能真的成交。
+        """開盤價能不能真的成交。
 
-        台股漲跌停是「鎖住」而不是「跌了 10%」：只要盤中有打開，開盤價就成交得到。
-        所以判定條件是 gap 夠大 + 開盤價貼在當日極值 + 當日振幅几乎為零。
-        這樣才不會把除權息的跳空、或是開低走高真的跌停打開誤判成不能交易。
+        台股漲跌停是「鎖住」不是「跌了 10%」，所以要看開盤價是否貼在當日極值、
+        當日振幅是否幾乎為零。只看幅度會把除權息跳空誤殺。
 
-        is_rebase：這天是分割/減資的重新定價日。那天的 gap 必然很大（4:1 就是 -75%），
-        但 ±10% 漲跌幅限制的推論在重新定價日不成立，直接跳過判定。
+        is_rebase：分割/減資的重新定價日，那天 gap 必然很大（4:1 是 -75%），
+        ±10% 的推論不成立，直接放行。
         """
         if bar.volume <= 0:
             return False, "no-trade"

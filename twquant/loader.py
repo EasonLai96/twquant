@@ -106,14 +106,10 @@ def load_adj_returns(
     end: str,
     jump: float = DEFAULT_JUMP,
 ) -> dict[str, float]:
-    """「重新定價日」的標記與其餘日子的日報酬。
+    """回傳每日報酬，但分割/減資日回傳 0.0 當記號，讓引擎知道那天要換算股數。
 
-    正常交易日回傳真實日報酬；分割/減資/除權息這種價格被重新定價的日子回傳 0.0，
-    引擎看到 0.0 就換算股數（而不是把 -75% 當成真跌）。
-
-    判定方式：優先信任還原因子表；不可用時（FinMind 的 adjust=1 實測是 no-op，
-    因子整條都是 1.0）用「單日跳動 >= jump」當結構性斷點。門檻放一點浮點容差，
-    不然剛好 20%（80/100-1 = -0.19999999999999996）會漏判。
+    優先用因子表；FinMind 的 adjust=1 實測是 no-op（整條都是 1.0），所以還是得靠
+    單日跳動門檻。門檻留一點相對容差，不然剛好 20% 的減資會漏判。
     """
     rows = bars_from_rows(store.load_bars(ticker, start, end))
     factors = store.load_factors(ticker, start, end)
