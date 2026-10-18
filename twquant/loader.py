@@ -106,29 +106,30 @@ def load_adj_returns(
     end: str,
     jump: float = DEFAULT_JUMP,
 ) -> dict[str, float]:
-    """每個交易日的「分割安全」日報酬。
+    """「重新定價日」的標記與其餘日子的日報酬。
 
-    兩道防線：
-      1. 還原因子若在某天改變（分割/減資），那天的報酬直接歸零。
-      2. FinMind 的 adjust=1 目前是 no-op，因子會整條都是 1.0，
-         這時改用「單日跳動 > jump」當結構性斷點（0050 的 4:1 分割是 -75%）。
-    台股有漲跌幅限制，正常交易日不可能出現這種幅度，所以門檻抓 20% 很安全。
+    正常交易日回傳真實日報酬；分割/減資/除權息這種價格被重新定價的日子回傳 0.0，
+    引擎看到 0.0 就換算股數（而不是把 -75% 當成真跌）。
+
+    判定方式：優先信任還原因子表；不可用時（FinMind 的 adjust=1 實測是 no-op，
+    因子整條都是 1.0）用「單日跳動 >= jump」當結構性斷點。門檻放一點浮點容差，
+    不然剛好 20%（80/100-1 = -0.19999999999999996）會漏判。
     """
-    rows = store.load_bars(ticker, start, end)
+    rows = bars_from_rows(store.load_bars(ticker, start, end))
     factors = store.load_factors(ticker, start, end)
+    limit = jump * (1 - 1e-9)
     out: dict[str, float] = {}
     for i in range(1, len(rows)):
-        d0, c0 = rows[i - 1][0], rows[i - 1][4]
-        d1, c1 = rows[i][0], rows[i][4]
-        if c0 is None or c1 is None or c0 <= 0 or c1 <= 0:
-            out[d1] = 0.0
-            continue
+        d0, c0 = rows[i - 1].date, rows[i - 1].close
+        d1, c1 = rows[i].date, rows[i].close
         f0, f1 = factors.get(d0, 1.0), factors.get(d1, 1.0)
         if f1 != f0:
             out[d1] = 0.0
             continue
+        if c0 <= 0 or c1 <= 0:
+            continue
         r = c1 / c0 - 1
-        out[d1] = 0.0 if abs(r) >= jump else r
+        out[d1] = 0.0 if abs(r) >= limit else r
     return out
 
 

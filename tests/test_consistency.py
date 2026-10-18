@@ -126,16 +126,20 @@ class SplitConsistency(unittest.TestCase):
             -0.02,
             f"分割被當成虧損了：報酬 {trade.ret * 100:.1f}%（價格完全沒動，這不該發生）",
         )
-        # 進場價與出場價都必須在「還原價」基準上：原始 100 元經過 4:1 之後
-        # 進場價要變成 25 附近，出場價本來就是 25 附近，兩者對得上才代表換算正確
+        # 新語意：價格不換算，改換算股數。4:1 分割 -> 持股數變成 4 倍、
+        # 每股成本降到 1/4，而進場價與出場價都留在原始價格座標、可以直接比。
         self.assertAlmostEqual(
             trade.entry_price,
             trade.exit_price,
             delta=trade.exit_price * 0.02,
-            msg=f"進場價 {trade.entry_price:.4f} 與出場價 {trade.exit_price:.4f} 不在同一個價格基準上",
+            msg=f"進場價 {trade.entry_price:.4f} 與出場價 {trade.exit_price:.4f} 應該都在原始價格座標上",
         )
-        self.assertLess(trade.entry_price, 30, f"進場價 {trade.entry_price:.2f} 沒有除過 4:1 分割")
-        self.assertGreater(trade.entry_price, 20, f"進場價 {trade.entry_price:.2f} 除得太多了")
+        self.assertGreater(trade.entry_price, 20, f"進場價 {trade.entry_price:.2f} 不該被除過分割")
+        self.assertGreater(
+            trade.shares,
+            1000 * 4 - 1,
+            f"4:1 分割後股數應該變成 4 倍以上，實際 {trade.shares}",
+        )
 
 
 class LimitUpThreshold(unittest.TestCase):
@@ -198,7 +202,7 @@ class DuplicateOrders(unittest.TestCase):
         """
         bars = mk_bars([100.0 + i * 0.5 for i in range(120)])
         engine = PortfolioBacktester(1_000_000, CostConfig(), max_positions=1)
-        positions = {"ASSET": Position("ASSET", 1000, 101.0, bars[60].date, 101.0, bars[60].close, bars[60].close)}
+        positions = {"ASSET": Position("ASSET", 1000, bars[60].date, bars[60].close, 101_000.0)}
         today = {bars[60].date: bars[60]}
         bars_by_date = {"ASSET": {b.date: b for b in bars}}
 
@@ -222,7 +226,7 @@ class DuplicateOrders(unittest.TestCase):
         """部分出場：策略賣掉一半，剩下的部位要留在帳上。"""
         bars = mk_bars([100.0 + i * 0.5 for i in range(120)])
         engine = PortfolioBacktester(1_000_000, CostConfig(), max_positions=1)
-        positions = {"ASSET": Position("ASSET", 2000, 101.0, bars[60].date, 101.0, bars[60].close, bars[60].close)}
+        positions = {"ASSET": Position("ASSET", 2000, bars[60].date, bars[60].close, 202_000.0)}
         resp = StrategyResponse(orders=[OrderIntent("ASSET", "sell", "half", shares=1000)], allocation={"ASSET": 0.15})
         orders = engine._plan(
             resp,
@@ -354,6 +358,59 @@ class AddThenExitConsistency(unittest.TestCase):
             trade.entry_price,
             170,
             f"entry_price {trade.entry_price:.2f} 看起來是第一次買進價，不是加權平均",
+        )
+
+
+    def test_multi_add_then_partial_exits_conserve_pnl(self):
+        """多次加碼 + 分批出場（加碼與部分出場的組合，先前是兩者各自的盲區）。
+
+        這裡同時考驗兩件事：
+          - entry_price 在每次加碼後都是加權平均（不是第一次買價）
+          - entry_fee 在部分出場時按股數比例分攤，不能漏扣或重複扣
+        最後一次賣光後，Σtrade.pnl 必須等於權益變化。
+        """
+        prices = [100.0 + i for i in range(200)]
+        bars = mk_bars(prices)
+
+        class MultiAddPartialExit:
+            name = "multi_add_partial_exit"
+
+            def params(self):
+                return {}
+
+            def on_bar(self, ctx):
+                if ctx.idx >= 150:
+                    return StrategyResponse(allocation={})
+                if ctx.idx == 150:
+                    return StrategyResponse(
+                        orders=[OrderIntent("ASSET", "sell", "half", shares=1000)], allocation={"ASSET": 0.0}
+                    )
+                if ctx.idx == 130:
+                    return StrategyResponse(
+                        orders=[OrderIntent("ASSET", "sell", "quarter", shares=1000)], allocation={"ASSET": 0.6}
+                    )
+                if ctx.idx == 100:
+                    return StrategyResponse(allocation={"ASSET": 0.8})
+                if ctx.idx == 80:
+                    return StrategyResponse(allocation={"ASSET": 0.5})
+                if ctx.idx == 60:
+                    return StrategyResponse(allocation={"ASSET": 0.2})
+                if ctx.idx > 60:
+                    return StrategyResponse(allocation={"ASSET": 0.2})
+                return StrategyResponse()
+
+        bt = PortfolioBacktester(1_000_000, CostConfig(), max_positions=1)
+        res = bt.run({"ASSET": bars}, MultiAddPartialExit(), benchmark=None)
+
+        self.assertGreaterEqual(len(res.trades), 2, "應該有多筆平倉紀錄（部分出場）")
+        self.assertAlmostEqual(res.snapshots[-1].holdings, 0.0, places=6, msg="最後必須完全空手")
+        pnl_sum = sum(t.pnl for t in res.trades)
+        equity_delta = res.metrics["final"] - res.metrics["initial"]
+        self.assertAlmostEqual(
+            pnl_sum,
+            equity_delta,
+            delta=3.0,
+            msg=f"多次加碼+部分出場：損益總和 {pnl_sum:,.2f} vs 權益變化 {equity_delta:,.2f}",
         )
 
 

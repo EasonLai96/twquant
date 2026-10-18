@@ -37,17 +37,40 @@ class CostConfig:
 class Position:
     ticker: str
     shares: int
-    cost: float
     entry_date: str
-    entry_price: float
     last_close: float
-    entry_fee: float = 0.0
-    # 進場價目前換算到哪個價格基準（分割/減資時會變）。用來判斷要不要再把成本換算一次。
-    basis: float = 1.0
+    # 現金成本（含買進手續費）。這是損益的唯一權威來源 —— 現金流出多少就是多少。
+    # 分割/減資不改變這個數字（你付出的現金沒變），改的是股數。
+    cash_cost: float
+
+    @property
+    def cost_per_share(self) -> float:
+        """每股綜合成本（含費），給報表看的。分割後股數變多，這個數字會跟著降。"""
+        return self.cash_cost / self.shares if self.shares else 0.0
 
 
 def _finite(x: float) -> bool:
     return x == x and x not in (float("inf"), float("-inf"))
+
+
+def is_rebase_date(adj_returns, ticker: str, date: str, prev_close: float, close: float) -> bool:
+    """這一天是不是「重新定價日」（分割/減資/除權息）。
+
+    判定：adj_returns 明確標記為 0（loader 的結構性斷點訊號），
+    但原始價格其實有明顯變動 —— 那就代表價格被換了基準，而不是真的漲跌停。
+    沒有 adj_returns 時回 False（合成資料或非 FinMind 來源不走這條路）。
+    """
+    if adj_returns is None:
+        return False
+    r = adj_returns.get(ticker, {}).get(date)
+    if r is None or r != 0.0:
+        return False
+    if prev_close <= 0 or close <= 0:
+        return False
+    return abs(prev_close / close - 1.0) > REBASE_TRIGGER
+
+
+REBASE_TRIGGER = 0.15
 
 
 @dataclass
@@ -184,39 +207,31 @@ class PortfolioBacktester:
 
             # 1) 先成交昨天收盤後排的單（今日開盤價）
             if pending:
-                cash = self._execute_orders(pending, positions, today, bars_of, cash, trades, costs)
+                cash = self._execute_orders(pending, positions, today, bars_of, cash, trades, costs, adj_returns)
                 pending = []
 
             # 2) 收盤後評價
             #
-            # 台股用「還原價」當基準：分割/減資當天價格會被重新定價（4:1 就是砍成 1/4），
-            # 持有人的財富不該因此改變。所以在那一天把「進場價換算到的基準」與成本一起
-            # 搬過去，並讓 last_close 直接等於「今天的還原價」。
+            # 全部留在「原始價格座標」：last_close = 當日原始收盤，市值 = 股數 × 原始價。
+            # 分割/減資（價格被重新定價）不換算價格，而是換算「股數」——
+            # 4:1 分割就是把 4000 股變成 16000 股，現金成本不變（你付出的現金沒變）。
             #
-            # 這裡不能用「last_close × (1+r)」連乘：分割日的 r 是 0，那個寫法會讓
-            # last_close 停在舊價位，之後每天都算出同一個 ratio 並重複相乘（會炸到 inf）。
+            # 這樣做的理由：換算價格會讓「市值座標」與「賣出收入座標」分家，
+            # 平倉時就會出現假虧損或假獲利，而 _plan 用原始價算部位市值、卻和
+            # 換算過的 equity 相比，還會誤加碼把權益灌爆。
+            # 換算股數則讓市值、賣出、損益、配置全部同一個座標，不需要任何特例。
             holdings_val = 0.0
             for p in positions.values():
                 b = today.get(p.ticker)
                 if b:
-                    r = (adj_returns or {}).get(p.ticker, {}).get(d)
-                    if r is None or b.close <= 0 or not _finite(r):
-                        p.last_close = b.close
-                    else:
-                        implied = p.last_close * (1 + r)
-                        raw_now = b.close * p.basis
-                        ratio = 1.0
-                        if _finite(implied) and _finite(raw_now) and raw_now > 0:
-                            ratio = implied / raw_now
-                        # 明顯偏離 1 才當成重新定價；順便擋掉 inf / 0 / NaN 這些病態值
-                        if not _finite(ratio) or ratio <= 0 or abs(ratio - 1.0) <= 1e-9:
-                            ratio = 1.0
-                        if ratio != 1.0:
-                            p.basis *= ratio
-                            p.entry_price /= ratio
-                            p.cost /= ratio
-                            raw_now = b.close * p.basis
-                        p.last_close = raw_now if _finite(raw_now) and raw_now > 0 else b.close
+                    prev_close = self._prev_bar(bars_of[p.ticker], d)
+                    if prev_close is not None and is_rebase_date(adj_returns, p.ticker, d, prev_close.close, b.close):
+                        k = prev_close.close / b.close
+                        if _finite(k) and k > 0 and abs(k - 1.0) > 1e-9:
+                            # 股數換算，現金成本不動。畸零股（分割比例不是整數時必然出現）
+                            # 留給後續平倉的 frac 分攤吸收，不會漏價值。
+                            p.shares = int(round(p.shares * k))
+                    p.last_close = b.close
                 holdings_val += p.shares * p.last_close
             equity = cash + holdings_val
             ret = (equity / prev_equity - 1) if prev_equity > 0 else 0.0
@@ -338,7 +353,7 @@ class PortfolioBacktester:
 
     # --- 成交 -----------------------------------------------------------------
 
-    def _execute_orders(self, orders, positions, today, bars_of, cash, trades, costs) -> float:
+    def _execute_orders(self, orders, positions, today, bars_of, cash, trades, costs, adj_returns=None) -> float:
         execs: list[dict] = []
         for o in orders:
             t = o["ticker"]
@@ -349,7 +364,9 @@ class PortfolioBacktester:
             prev = self._prev_bar(bars, b.date)
             if prev is None or prev.close <= 0:
                 continue
-            can, _ = self._tradable(b, prev.close, o["side"])
+            r = (adj_returns or {}).get(t, {}).get(b.date)
+            is_rebase = is_rebase_date(adj_returns, t, b.date, prev.close, b.close)
+            can, _ = self._tradable(b, prev.close, o["side"], is_rebase)
             if not can:
                 continue
             execs.append({**o, "bar": b})
@@ -363,7 +380,6 @@ class PortfolioBacktester:
                 sold = min(int(o["shares"]), p.shares)
                 if sold <= 0:
                     continue
-                frac = sold / p.shares
                 px = self._sell_price(b.open)
                 gross = px * sold
                 fee = self._fee(gross)
@@ -372,21 +388,22 @@ class PortfolioBacktester:
                 costs.fee += fee
                 costs.tax += tax
                 costs.slippage += (b.open - px) * sold
-                # 損益要含去程成本，否則交易紀錄的總和對不上權益曲線的變化。
-                # 部分出場時費用按比例分攤（以股數為權重）。
-                fee_share = p.entry_fee * frac
-                pnl = (px - p.entry_price) * sold - fee - tax - fee_share
-                base = p.entry_price * sold
+                # 損益直接用現金算：賣出淨收入 − 這批股數分攤到的現金成本。
+                # 這條等式保證 Σtrade.pnl 與權益曲線的變化完全一致（部分出場也成立）。
+                cost_share = p.cash_cost * (sold / p.shares)
+                pnl = gross - fee - tax - cost_share
+                base = p.cash_cost / p.shares
+                avg_cost = p.cost_per_share
                 trades.append(
                     Trade(
                         t,
                         p.entry_date,
                         b.date,
-                        round(p.entry_price, 4),
+                        round(avg_cost, 4),
                         round(px, 4),
                         sold,
                         round(pnl, 2),
-                        round(pnl / base, 5) if base else 0.0,
+                        round(pnl / (cost_share or 1.0), 5),
                         self._days_between(p.entry_date, b.date),
                         o.get("reason", ""),
                     )
@@ -395,7 +412,7 @@ class PortfolioBacktester:
                     positions.pop(t, None)
                 else:
                     p.shares -= sold
-                    p.entry_fee -= fee_share
+                    p.cash_cost -= cost_share
             else:
                 px = self._buy_price(b.open)
                 shares = int(o["shares"])
@@ -406,35 +423,33 @@ class PortfolioBacktester:
                 cash -= gross + fee
                 costs.fee += fee
                 costs.slippage += (px - b.open) * shares
-                if t in positions:
-                    p = positions[t]
-                    if p.shares <= 0:
-                        positions.pop(t, None)
-                        positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, fee)
-                    else:
-                        total = p.cost * p.shares + gross + fee
-                        p.shares += shares
-                        p.cost = total / p.shares
-                        p.entry_fee += fee
-                        # entry_price 是不含費的加權平均成交價。
-                        # 不跟著更新的話，平倉時 (px - entry_price) 會拿「第一次買進價」
-                        # 結算含加碼在內的整個部位，損益與 win_rate / profit_factor 全部虛增。
-                        p.entry_price = (p.cost * p.shares - p.entry_fee) / p.shares
+                pos = positions.get(t)
+                if pos is not None and pos.shares > 0:
+                    pos.shares += shares
+                    pos.cash_cost += gross + fee
+                    pos.last_close = px
                 else:
-                    positions[t] = Position(t, shares, (gross + fee) / shares, b.date, px, b.close, fee)
+                    # 新建部位：last_close 從成交價起算，當天不套用報酬，
+                    # 否則開盤買進會被套上「昨收至今收」的價差
+                    positions[t] = Position(t, shares, b.date, px, gross + fee)
         return cash
 
-    def _tradable(self, bar: Bar, prev_close: float, side: str) -> tuple[bool, str]:
+    def _tradable(self, bar: Bar, prev_close: float, side: str, is_rebase: bool = False) -> tuple[bool, str]:
         """判斷這根 bar 的開盤價能不能真的成交。
 
         台股漲跌停是「鎖住」而不是「跌了 10%」：只要盤中有打開，開盤價就成交得到。
         所以判定條件是 gap 夠大 + 開盤價貼在當日極值 + 當日振幅几乎為零。
         這樣才不會把除權息的跳空、或是開低走高真的跌停打開誤判成不能交易。
+
+        is_rebase：這天是分割/減資的重新定價日。那天的 gap 必然很大（4:1 就是 -75%），
+        但 ±10% 漲跌幅限制的推論在重新定價日不成立，直接跳過判定。
         """
         if bar.volume <= 0:
             return False, "no-trade"
         if prev_close <= 0 or bar.open <= 0:
             return False, "bad-ref"
+        if is_rebase:
+            return True, ""
         gap = bar.open / prev_close - 1
         pinned = (bar.high - bar.low) / bar.open <= 0.002 if bar.open > 0 else True
         if side == "buy":
@@ -465,7 +480,8 @@ class PortfolioBacktester:
         holding_days = {}
         for t, p in positions.items():
             views[t] = PositionView(
-                t, p.shares, p.cost, p.entry_date, p.last_close, (p.last_close - p.cost) * p.shares
+                t, p.shares, p.cost_per_share, p.entry_date, p.last_close,
+                (p.last_close - p.cost_per_share) * p.shares,
             )
             i = idx_of.get(t, {}).get(date)
             holding_days[t] = i if i is not None else 0
